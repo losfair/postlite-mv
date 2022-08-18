@@ -3,12 +3,12 @@ package postlite
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -105,6 +105,8 @@ type Server struct {
 
 	// Directory that holds SQLite databases.
 	DataDir string
+
+	DatabaseNameRegex *regexp.Regexp
 }
 
 func NewServer() *Server {
@@ -117,8 +119,10 @@ func NewServer() *Server {
 
 func (s *Server) Open() (err error) {
 	// Ensure data directory exists.
-	if _, err := os.Stat(s.DataDir); err != nil {
-		return err
+	if s.DataDir != "" {
+		if _, err := os.Stat(s.DataDir); err != nil {
+			return err
+		}
 	}
 
 	s.ln, err = net.Listen("tcp", s.Addr)
@@ -244,29 +248,69 @@ func (s *Server) serveConn(ctx context.Context, c *Conn) error {
 	}
 }
 
-func (s *Server) serveConnStartup(ctx context.Context, c *Conn) error {
-	msg, err := c.backend.ReceiveStartupMessage()
-	if err != nil {
-		return fmt.Errorf("receive startup message: %w", err)
-	}
-
-	switch msg := msg.(type) {
-	case *pgproto3.StartupMessage:
-		if err := s.handleStartupMessage(ctx, c, msg); err != nil {
-			return fmt.Errorf("startup message: %w", err)
-		}
-		return nil
-	case *pgproto3.SSLRequest:
-		if err := s.handleSSLRequestMessage(ctx, c, msg); err != nil {
-			return fmt.Errorf("ssl request message: %w", err)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unexpected startup message: %#v", msg)
-	}
+type startupState struct {
+	*Server
+	isStartupMessage  bool
+	name              string
+	done              bool
+	expectingStartup  bool
+	expectingSSL      bool
+	expectingPassword bool
 }
 
-func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto3.StartupMessage) (err error) {
+func (s *Server) serveConnStartup(ctx context.Context, c *Conn) error {
+	state := &startupState{
+		Server:            s,
+		done:              false,
+		isStartupMessage:  true,
+		expectingStartup:  true,
+		expectingSSL:      true,
+		expectingPassword: false,
+	}
+
+	for !state.done {
+		state.done = true
+		var msg pgproto3.FrontendMessage
+		var err error
+		if state.isStartupMessage {
+			msg, err = c.backend.ReceiveStartupMessage()
+		} else {
+			msg, err = c.backend.Receive()
+		}
+		if err != nil {
+			return fmt.Errorf("receive startup message: %w", err)
+		}
+
+		switch msg := msg.(type) {
+		case *pgproto3.StartupMessage:
+			if !state.expectingStartup {
+				return fmt.Errorf("unexpected StartupMessage")
+			}
+			if err := state.handleStartupMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("startup message: %w", err)
+			}
+		case *pgproto3.SSLRequest:
+			if !state.expectingSSL {
+				return fmt.Errorf("unexpected SSLRequest")
+			}
+			if err := state.handleSSLRequestMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("ssl request message: %w", err)
+			}
+		case *pgproto3.PasswordMessage:
+			if !state.expectingPassword {
+				return fmt.Errorf("unexpected PasswordMessage")
+			}
+			if err := state.handlePasswordMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("password message: %w", err)
+			}
+		default:
+			return fmt.Errorf("unexpected startup message: %#v", msg)
+		}
+	}
+	return nil
+}
+
+func (s *startupState) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto3.StartupMessage) (err error) {
 	log.Printf("received startup message: %#v", msg)
 
 	// Validate
@@ -277,8 +321,40 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 		return writeMessages(c, &pgproto3.ErrorResponse{Message: "invalid database name"})
 	}
 
-	// Open SQL database & attach to the connection.
-	if c.db, err = sql.Open("postlite-sqlite3", filepath.Join(s.DataDir, name)); err != nil {
+	if s.DatabaseNameRegex != nil && !s.DatabaseNameRegex.MatchString(name) {
+		return writeMessages(c, &pgproto3.ErrorResponse{Message: "database not allowed"})
+	}
+
+	s.name = name
+
+	if strings.Contains(name, ":") {
+		s.done = false
+		s.expectingStartup = false
+		s.expectingSSL = false
+		s.expectingPassword = true
+		s.isStartupMessage = false
+		return writeMessages(c,
+			&pgproto3.AuthenticationCleartextPassword{},
+		)
+	} else {
+		return s.doOpen(ctx, c, s.name+"?_busy_timeout=0")
+	}
+}
+
+func (s *startupState) handlePasswordMessage(ctx context.Context, c *Conn, msg *pgproto3.PasswordMessage) error {
+	log.Printf("received password message")
+	pwBytes, err := hex.DecodeString(msg.Password)
+	if err != nil {
+		return fmt.Errorf("invalid password")
+	}
+
+	openPath := s.name + "." + hex.EncodeToString(pwBytes) + "?_busy_timeout=0"
+	return s.doOpen(ctx, c, openPath)
+}
+
+func (s *startupState) doOpen(ctx context.Context, c *Conn, openPath string) error {
+	var err error
+	if c.db, err = sql.Open("postlite-sqlite3", openPath); err != nil {
 		return err
 	}
 
@@ -317,12 +393,15 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 	)
 }
 
-func (s *Server) handleSSLRequestMessage(ctx context.Context, c *Conn, msg *pgproto3.SSLRequest) error {
+func (s *startupState) handleSSLRequestMessage(ctx context.Context, c *Conn, msg *pgproto3.SSLRequest) error {
 	log.Printf("received ssl request message: %#v", msg)
 	if _, err := c.Write([]byte("N")); err != nil {
 		return err
 	}
-	return s.serveConnStartup(ctx, c)
+
+	s.done = false
+	s.expectingSSL = false
+	return nil
 }
 
 func (s *Server) handleQueryMessage(ctx context.Context, c *Conn, msg *pgproto3.Query) error {

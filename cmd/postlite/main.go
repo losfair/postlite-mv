@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 
 	"github.com/benbjohnson/postlite"
 )
@@ -24,17 +25,19 @@ func main() {
 func run(ctx context.Context) error {
 	addr := flag.String("addr", ":5432", "postgres protocol bind address")
 	dataDir := flag.String("data-dir", "", "data directory")
+	databaseNameRegex := flag.String("database-name-regex", "", "regular expression to check against database name")
 	flag.Parse()
-
-	if *dataDir == "" {
-		return fmt.Errorf("required: -data-dir PATH")
-	}
 
 	log.SetFlags(0)
 
 	s := postlite.NewServer()
 	s.Addr = *addr
 	s.DataDir = *dataDir
+
+	if *databaseNameRegex != "" {
+		s.DatabaseNameRegex = regexp.MustCompile(*databaseNameRegex)
+	}
+
 	if err := s.Open(); err != nil {
 		return err
 	}
